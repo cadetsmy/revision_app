@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Revision App</title>
+  <style>
+    body { font-family: sans-serif; max-width: 700px; margin: 40px auto; padding: 0 20px; }
+    .view { display: none; }
+    .view.active { display: block; }
+    .question { margin-bottom: 20px; padding: 12px; border: 1px solid #ddd; border-radius: 6px; }
+    .question p { font-weight: bold; margin-bottom: 8px; }
+    label { display: block; padding: 4px 0; cursor: pointer; }
+    input[type=text], input[type=email], select { padding: 8px; font-size: 15px; width: 100%; margin: 6px 0 16px; box-sizing: border-box; }
+    button { padding: 10px 20px; font-size: 16px; cursor: pointer; }
+    .concept-row { display: flex; justify-content: space-between; padding: 8px; border-bottom: 1px solid #eee; }
+    .weak { color: #c0392b; font-weight: bold; }
+    .strong { color: #27ae60; }
+    #banner { padding: 12px; border-radius: 6px; margin-bottom: 16px; display: none; }
+  </style>
+</head>
+<body>
+  <h1>Revision App</h1>
+  <div id="banner"></div>
+
+  <!-- LOGIN -->
+  <div id="view-login" class="view active">
+    <h2>Who's studying?</h2>
+    <input type="text" id="loginName" placeholder="Your name">
+    <input type="email" id="loginEmail" placeholder="Your email">
+    <button id="loginBtn">Continue</button>
+  </div>
+
+  <!-- CHAPTER SELECT -->
+  <div id="view-select" class="view">
+    <h2>Pick a chapter</h2>
+    <select id="chapterSelect"></select>
+    <button id="startQuizBtn">Start Quiz</button>
+    <p><button id="showDiagnosticsBtn">View my weak areas so far</button></p>
+  </div>
+
+  <!-- QUIZ -->
+  <div id="view-quiz" class="view">
+    <h2 id="quizTitle"></h2>
+    <div id="quizQuestions"></div>
+    <button id="submitBtn">Submit</button>
+  </div>
+
+  <!-- RESULT -->
+  <div id="view-result" class="view">
+    <h2>Result</h2>
+    <p id="resultText"></p>
+    <button id="viewDiagnosticsFromResultBtn">View my weak areas</button>
+    <button id="backToSelectBtn">Take another chapter</button>
+  </div>
+
+  <!-- DIAGNOSTICS -->
+  <div id="view-diagnostics" class="view">
+    <h2>Your weak areas</h2>
+    <p>Based on every question you've ever answered, by concept.</p>
+    <div id="conceptList"></div>
+    <button id="backToSelectBtn2">Back</button>
+  </div>
+
+  <script type="module">
+    import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+
+    const supabase = createClient(
+      'https://nmonmmqaicmieyevllhr.supabase.co',
+      'sb_publishable_-DWIweBHS-Adjj-Qg2zGTQ_Jh4hNjt4'
+    )
+
+    // ---------- shared state ----------
+    let student = null
+    let chapters = []       // [{id, name, subject_id, subjects:{name}}]
+    let currentChapterId = null
+    let questions = []      // flattened, current quiz
+    let currentTestId = null
+
+    // ---------- view helper ----------
+    function showView(id) {
+      document.querySelectorAll('.view').forEach(v => v.classList.remove('active'))
+      document.getElementById(id).classList.add('active')
+    }
+
+    function banner(msg, isError) {
+      const b = document.getElementById('banner')
+      b.textContent = msg
+      b.style.display = 'block'
+      b.style.background = isError ? '#fdd' : '#dfd'
+    }
+
+    // ============================================================
+    // STEP 1: LOGIN (find-or-create student by email)
+    // ============================================================
+    document.getElementById('loginBtn').addEventListener('click', async () => {
+      const name = document.getElementById('loginName').value.trim()
+      const email = document.getElementById('loginEmail').value.trim()
+      if (!name || !email) { banner('Enter both name and email.', true); return }
+
+      // does this student already exist?
+      const { data: existing, error: findErr } = await supabase
+        .from('students')
+        .select('*')
+        .eq('email', email)
+        .maybeSingle()
+
+      if (findErr) { banner('Login error: ' + findErr.message, true); return }
+
+      if (existing) {
+        student = existing
+      } else {
+        const { data: created, error: createErr } = await supabase
+          .from('students')
+          .insert({ name, email, board: 'CBSE' })
+          .select()
+          .single()
+        if (createErr) { banner('Signup error: ' + createErr.message, true); return }
+        student = created
+      }
+
+      await loadChapters()
+      showView('view-select')
+    })
+
+    // ============================================================
+    // STEP 2: LOAD CHAPTER LIST
+    // ============================================================
+    async function loadChapters() {
+      const { data, error } = await supabase
+        .from('chapters')
+        .select('id, name, subject_id, subjects ( name, board, class )')
+
+      if (error) { banner('Could not load chapters: ' + error.message, true); return }
+
+      chapters = data
+      const sel = document.getElementById('chapterSelect')
+      sel.innerHTML = chapters.map(c =>
+        `<option value="${c.id}">${c.subjects.name} - ${c.name} (Class ${c.subjects.class})</option>`
+      ).join('')
+    }
+
+    // ============================================================
+    // STEP 3: START QUIZ (fetch nested questions for chosen chapter)
+    // ============================================================
+    document.getElementById('startQuizBtn').addEventListener('click', async () => {
+      currentChapterId = Number(document.getElementById('chapterSelect').value)
+      const chapter = chapters.find(c => c.id === currentChapterId)
+
+      const { data, error } = await supabase
+        .from('chapters')
+        .select(`
+          name,
+          topics ( name, concepts ( name, questions (*) ) )
+        `)
+        .eq('id', currentChapterId)
+        .single()
+
+      if (error) { banner('Could not load questions: ' + error.message, true); return }
+
+      questions = []
+      for (const topic of data.topics) {
+        for (const concept of topic.concepts) {
+          for (const q of concept.questions) {
+            questions.push({ ...q, topic: topic.name, concept: concept.name })
+          }
+        }
+      }
+
+      if (questions.length === 0) { banner('This chapter has no questions yet.', true); return }
+
+      // create a test record for this attempt
+      const { data: test, error: testErr } = await supabase
+        .from('tests')
+        .insert({ subject_id: chapter.subject_id, name: data.name + ' Quiz', total_questions: questions.length })
+        .select()
+        .single()
+      if (testErr) { banner('Could not start test: ' + testErr.message, true); return }
+      currentTestId = test.id
+
+      document.getElementById('quizTitle').textContent = data.name
+      document.getElementById('quizQuestions').innerHTML = questions.map((q, i) => `
+        <div class="question" data-qid="${q.id}">
+          <p>Q${i + 1}. ${q.question_text}</p>
+          <label><input type="radio" name="q${q.id}" value="A"> ${q.option_a}</label>
+          <label><input type="radio" name="q${q.id}" value="B"> ${q.option_b}</label>
+          <label><input type="radio" name="q${q.id}" value="C"> ${q.option_c}</label>
+          <label><input type="radio" name="q${q.id}" value="D"> ${q.option_d}</label>
+        </div>
+      `).join('')
+
+      showView('view-quiz')
+    })
+
+    // ============================================================
+    // STEP 4: SUBMIT QUIZ (score + save attempt + save per-question answers)
+    // ============================================================
+    document.getElementById('submitBtn').addEventListener('click', async () => {
+      const btn = document.getElementById('submitBtn')
+      btn.disabled = true
+      btn.textContent = 'Saving...'
+
+      let score = 0
+      const answers = []
+      for (const q of questions) {
+        const selected = document.querySelector(`input[name="q${q.id}"]:checked`)
+        const chosen = selected ? selected.value : null
+        const isCorrect = chosen === q.correct_answer
+        if (isCorrect) score++
+        answers.push({
+          student_id: student.id,
+          question_id: q.id,
+          selected_answer: chosen,
+          is_correct: isCorrect
+        })
+      }
+
+      await supabase.from('test_attempts').insert({
+        test_id: currentTestId,
+        student_id: student.id,
+        score: score,
+        total_questions: questions.length,
+        completed_at: new Date().toISOString()
+      })
+
+      const { error: qaError } = await supabase.from('question_attempts').insert(answers)
+      if (qaError) banner('Some answers failed to save: ' + qaError.message, true)
+
+      document.getElementById('resultText').textContent =
+        `You scored ${score} / ${questions.length}.`
+
+      btn.disabled = false
+      btn.textContent = 'Submit'
+      showView('view-result')
+    })
+
+    // ============================================================
+    // STEP 5: DIAGNOSTICS (aggregate question_attempts by concept)
+    // ============================================================
+    async function loadDiagnostics() {
+      const { data, error } = await supabase
+        .from('question_attempts')
+        .select(`
+          is_correct,
+          questions ( concepts ( name, topics ( name ) ) )
+        `)
+        .eq('student_id', student.id)
+
+      if (error) { banner('Could not load diagnostics: ' + error.message, true); return }
+
+      if (!data.length) {
+        document.getElementById('conceptList').innerHTML = '<p>No attempts yet - take a quiz first.</p>'
+        showView('view-diagnostics')
+        return
+      }
+
+      // aggregate: concept name -> { correct, total }
+      const stats = {}
+      for (const row of data) {
+        const conceptName = row.questions.concepts.name
+        const topicName = row.questions.concepts.topics.name
+        const key = topicName + ' > ' + conceptName
+        if (!stats[key]) stats[key] = { correct: 0, total: 0 }
+        stats[key].total++
+        if (row.is_correct) stats[key].correct++
+      }
+
+      const rows = Object.entries(stats).map(([concept, s]) => {
+        const pct = Math.round((s.correct / s.total) * 100)
+        const cls = pct < 60 ? 'weak' : 'strong'
+        const label = pct < 60 ? ' (needs revision)' : ''
+        return { concept, pct, cls, label, total: s.total }
+      }).sort((a, b) => a.pct - b.pct)
+
+      document.getElementById('conceptList').innerHTML = rows.map(r => `
+        <div class="concept-row">
+          <span>${r.concept} <small>(${r.total} attempted)</small></span>
+          <span class="${r.cls}">${r.pct}%${r.label}</span>
+        </div>
+      `).join('')
+
+      showView('view-diagnostics')
+    }
+
+    document.getElementById('showDiagnosticsBtn').addEventListener('click', loadDiagnostics)
+    document.getElementById('viewDiagnosticsFromResultBtn').addEventListener('click', loadDiagnostics)
+
+    // ============================================================
+    // NAVIGATION
+    // ============================================================
+    document.getElementById('backToSelectBtn').addEventListener('click', () => showView('view-select'))
+    document.getElementById('backToSelectBtn2').addEventListener('click', () => showView('view-select'))
+  </script>
+</body>
+</html>
